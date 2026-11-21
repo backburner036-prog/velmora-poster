@@ -1,314 +1,440 @@
-"""VELMORA — travel poster for a place that isn't there.
+"""VELMORA poster renderer — 100% PURE STDLIB.
 
-Procedural PIL poster, 1024x1024, deterministic (seed 7), no network,
-no external assets. The only text in the image is the place name VELMORA.
+No PIL, no numpy, no fonts on disk, no network, no external assets.
+Only: math, random, zlib, struct, hashlib, os, sys (via main.py).
+
+Image: 1024x1024 RGB bytearray buffer. Own gradient / ellipse /
+polygon / thick-line / arc helpers, own 5x7 bitmap font for VELMORA,
+own PNG encoder (IHDR + IDAT zlib level 6 + IEND, no tEXt/tIME).
+Deterministic: random.seed(7).
 """
 
 import math
 import random
+import struct
+import zlib
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
-
-W = H = 1024
-PLACE_NAME = "VELMORA"
-
-# Palette (7 colours, purposeful)
-SKY_TOP = (0x2B, 0x23, 0x50)      # #2B2350 deep dusk purple
-CORAL = (0xFF, 0x7E, 0x5F)         # #FF7E5F sunset coral band
-AMBER = (0xFF, 0xB3, 0x47)         # #FFB347 amber sun / lantern light
-CREAM = (0xF7, 0xE8, 0xC9)         # #F7E8C9 warm cream (name + sand)
-TURQUOISE = (0x2E, 0xC4, 0xB6)     # #2EC4B6 bright lagoon
-TEAL = (0x0E, 0x6E, 0x7A)          # #0E6E7A deep teal sea
-NAVY = (0x1D, 0x2A, 0x4A)          # #1D2A4A dark navy silhouettes
-STONE_LIGHT = (0x8E, 0x8B, 0xA8)   # pale tower stone, sunlit side
-STONE_DARK = (0x3A, 0x3A, 0x5E)    # tower stone, shaded side
-
+W = 1024
+H = 1024
 HORIZON = 560
-SUN_CENTRE = (700, 470)
-SUN_R = 70
 
-FONT_CANDIDATES = [
-    ("/usr/share/fonts/truetype/lato/Lato-Black.ttf", "Lato Black"),
-    ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "DejaVu Sans Bold"),
-    ("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf", "Noto Sans Bold"),
-]
-
-
-def load_font(size):
-    """Try the fallback chain in order; PIL default only as last resort."""
-    for path, label in FONT_CANDIDATES:
-        try:
-            return ImageFont.truetype(path, size), label
-        except Exception:
-            continue
-    return ImageFont.load_default(), "PIL default (emergency)"
+# Palette (design brief, 7 colours)
+SKY_TOP = (0x2B, 0x23, 0x50)    # #2B2350 deep dusk purple
+CORAL = (0xFF, 0x7E, 0x5F)      # #FF7E5F sunset coral
+AMBER = (0xFF, 0xB3, 0x47)      # #FFB347 sun amber / lantern light
+CREAM = (0xF7, 0xE8, 0xC9)      # #F7E8C9 name + sand
+TURQ = (0x2E, 0xC4, 0xB6)       # #2EC4B6 lagoon turquoise
+TEAL = (0x0E, 0x6E, 0x7A)       # #0E6E7A deep teal
+NAVY = (0x1D, 0x2A, 0x4A)       # #1D2A4A dark navy silhouettes
+STONE = (0x8E, 0x8B, 0xA8)      # pale stone side of the tower (sunlit)
 
 
 def _lerp(a, b, t):
-    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+    return int(a + (b - a) * t + 0.5)
 
 
-def _vgrad_numpy(width, height, stops):
-    """Vertical gradient through (y_fraction, colour) stops. Numpy path."""
-    import numpy as np
-
-    ys = [s[0] * (height - 1) for s in stops]
-    cols = [s[1] for s in stops]
-    out = np.zeros((height, width, 3), dtype=np.uint8)
-    y = np.arange(height, dtype=float)
-    for i in range(len(stops) - 1):
-        y0, y1 = ys[i], ys[i + 1]
-        c0 = np.array(cols[i], dtype=float)
-        c1 = np.array(cols[i + 1], dtype=float)
-        mask = (y >= y0) & (y <= y1)
-        t = np.clip((y[mask] - y0) / max(y1 - y0, 1.0), 0.0, 1.0)
-        band = (c0[None, :] + (c1 - c0)[None, :] * t[:, None]).astype(np.uint8)
-        out[mask] = band[:, None, :]
-    out[y < ys[0]] = cols[0]
-    out[y > ys[-1]] = cols[-1]
-    return Image.fromarray(out, "RGB")
+def _mix(c1, c2, t):
+    return (_lerp(c1[0], c2[0], t), _lerp(c1[1], c2[1], t),
+            _lerp(c1[2], c2[2], t))
 
 
-def _vgrad_pure(width, height, stops):
-    """Same gradient, pure PIL (no numpy) — fallback for the grader sandbox."""
-    img = Image.new("RGB", (width, height))
-    d = ImageDraw.Draw(img)
-    ys = [s[0] * (height - 1) for s in stops]
-    for row in range(height):
-        if row <= ys[0]:
-            col = stops[0][1]
-        elif row >= ys[-1]:
-            col = stops[-1][1]
+def _multi_stop(stops, t):
+    """stops: list of (pos 0..1, rgb). Piecewise-linear gradient."""
+    if t <= stops[0][0]:
+        return stops[0][1]
+    for i in range(1, len(stops)):
+        p0, c0 = stops[i - 1]
+        p1, c1 = stops[i]
+        if t <= p1:
+            f = 0.0 if p1 == p0 else (t - p0) / (p1 - p0)
+            return _mix(c0, c1, f)
+    return stops[-1][1]
+
+
+class Canvas:
+    def __init__(self, w=W, h=H):
+        self.w = w
+        self.h = h
+        self.buf = bytearray(w * h * 3)
+
+    # -- low level -----------------------------------------------------
+    def _idx(self, x, y):
+        return (y * self.w + x) * 3
+
+    def blend_px(self, x, y, color, alpha):
+        """Alpha-blend one pixel. alpha 0..255."""
+        if alpha <= 0 or x < 0 or y < 0 or x >= self.w or y >= self.h:
+            return
+        if alpha >= 255:
+            i = self._idx(x, y)
+            self.buf[i] = color[0]
+            self.buf[i + 1] = color[1]
+            self.buf[i + 2] = color[2]
+            return
+        i = self._idx(x, y)
+        a = alpha
+        ia = 255 - a
+        self.buf[i] = (color[0] * a + self.buf[i] * ia) // 255
+        self.buf[i + 1] = (color[1] * a + self.buf[i + 1] * ia) // 255
+        self.buf[i + 2] = (color[2] * a + self.buf[i + 2] * ia) // 255
+
+    def fill_rect(self, x, y, rw, rh, color, alpha=255):
+        x0 = max(0, x)
+        y0 = max(0, y)
+        x1 = min(self.w, x + rw)
+        y1 = min(self.h, y + rh)
+        if x1 <= x0 or y1 <= y0:
+            return
+        if alpha >= 255:
+            row = bytes(color) * (x1 - x0)
+            for yy in range(y0, y1):
+                s = self._idx(x0, yy)
+                self.buf[s:s + len(row)] = row
         else:
-            col = stops[-1][1]
-            for i in range(len(stops) - 1):
-                if ys[i] <= row <= ys[i + 1]:
-                    t = (row - ys[i]) / max(ys[i + 1] - ys[i], 1.0)
-                    col = _lerp(stops[i][1], stops[i + 1][1], t)
-                    break
-        d.line([(0, row), (width, row)], fill=col)
-    return img
+            for yy in range(y0, y1):
+                for xx in range(x0, x1):
+                    self.blend_px(xx, yy, color, alpha)
 
+    def fill_row(self, y, color):
+        s = y * self.w * 3
+        self.buf[s:s + self.w * 3] = bytes(color) * self.w
 
-def _vgrad(width, height, stops):
-    try:
-        return _vgrad_numpy(width, height, stops)
-    except Exception:
-        return _vgrad_pure(width, height, stops)
+    def vgrad(self, y0, y1, stops):
+        span = max(1, y1 - y0)
+        for y in range(y0, min(y1, self.h)):
+            t = (y - y0) / span
+            self.fill_row(y, _multi_stop(stops, t))
 
-
-def _text_width(draw, font, text, tracking):
-    total = 0
-    for ch in text:
-        bbox = draw.textbbox((0, 0), ch, font=font)
-        total += (bbox[2] - bbox[0]) + tracking
-    return total - tracking
-
-
-def _draw_name(img):
-    """VELMORA — the only text in the poster. Tracked, cream, navy shadow."""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    target_w = 730
-    size = 150
-    font, font_name = load_font(size)
-    # Fit: scale the font size until the tracked width lands near target.
-    for _ in range(12):
-        w = _text_width(d, font, PLACE_NAME, 12)
-        if abs(w - target_w) <= 12 or size <= 40:
-            break
-        size = max(40, int(size * target_w / max(w, 1)))
-        font, font_name = load_font(size)
-    tracking = 12
-    total_w = _text_width(d, font, PLACE_NAME, tracking)
-    x = (W - total_w) // 2
-    # Vertical centre of the name band y 110-260 -> text top ~120.
-    bbox = d.textbbox((0, 0), PLACE_NAME, font=font)
-    text_h = bbox[3] - bbox[1]
-    y_top = 130 - bbox[1]
-    for dx, dy, fill in ((0, 6, NAVY + (255,)), (0, 0, None)):
-        cx = x
-        for ch in PLACE_NAME:
-            cb = d.textbbox((0, 0), ch, font=font)
-            cw = cb[2] - cb[0]
-            if fill is not None:
-                d.text((cx - cb[0] + dx, y_top + dy), ch, font=font,
-                       fill=fill)
+    # -- shapes --------------------------------------------------------
+    def fill_ellipse(self, cx, cy, rx, ry, color, alpha=255):
+        if rx <= 0 or ry <= 0:
+            return
+        for y in range(max(0, cy - ry), min(self.h, cy + ry + 1)):
+            dy = (y - cy) / ry
+            rem = 1.0 - dy * dy
+            if rem < 0:
+                continue
+            dx = int(rx * math.sqrt(rem))
+            x0 = max(0, cx - dx)
+            x1 = min(self.w - 1, cx + dx)
+            if alpha >= 255:
+                row = bytes(color) * (x1 - x0 + 1)
+                s = self._idx(x0, y)
+                self.buf[s:s + len(row)] = row
             else:
-                d.text((cx - cb[0] + dx, y_top + dy), ch, font=font,
-                       fill=CREAM + (255,), stroke_width=3,
-                       stroke_fill=NAVY + (255,))
-            cx += cw + tracking
-    img.alpha_composite(layer)
-    return font_name, size, total_w, text_h
+                for xx in range(x0, x1 + 1):
+                    self.blend_px(xx, y, color, alpha)
+
+    def fill_disc(self, cx, cy, r, color, alpha=255):
+        self.fill_ellipse(cx, cy, r, r, color, alpha)
+
+    def fill_polygon(self, pts, color, alpha=255):
+        """Scanline polygon fill (sorted edge intersections)."""
+        if len(pts) < 3:
+            return
+        ys = [p[1] for p in pts]
+        y0 = max(0, min(ys))
+        y1 = min(self.h - 1, max(ys))
+        n = len(pts)
+        for y in range(y0, y1 + 1):
+            xs = []
+            for i in range(n):
+                x1, y1p = pts[i]
+                x2, y2p = pts[(i + 1) % n]
+                if y1p == y2p:
+                    continue
+                if (y >= min(y1p, y2p)) and (y < max(y1p, y2p)):
+                    t = (y - y1p) / (y2p - y1p)
+                    xs.append(x1 + t * (x2 - x1))
+            if len(xs) < 2:
+                continue
+            xs.sort()
+            for k in range(0, len(xs) - 1, 2):
+                xa = max(0, int(math.ceil(xs[k])))
+                xb = min(self.w - 1, int(math.floor(xs[k + 1])))
+                if xb < xa:
+                    continue
+                if alpha >= 255:
+                    row = bytes(color) * (xb - xa + 1)
+                    s = self._idx(xa, y)
+                    self.buf[s:s + len(row)] = row
+                else:
+                    for xx in range(xa, xb + 1):
+                        self.blend_px(xx, y, color, alpha)
+
+    def thick_line(self, x0, y0, x1, y1, color, width=3, alpha=255):
+        """Thick line via discs stamped along the segment."""
+        dx = x1 - x0
+        dy = y1 - y0
+        dist = math.hypot(dx, dy)
+        steps = max(1, int(dist))
+        r = max(1, width // 2)
+        for s in range(steps + 1):
+            t = s / steps
+            self.fill_disc(int(x0 + dx * t), int(y0 + dy * t), r, color,
+                           alpha)
+
+    def bezier(self, p0, p1, p2, color, width=6, alpha=255, steps=80):
+        prev = None
+        for s in range(steps + 1):
+            t = s / steps
+            mt = 1 - t
+            x = int(mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0])
+            y = int(mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1])
+            if prev is not None:
+                self.thick_line(prev[0], prev[1], x, y, color, width, alpha)
+            prev = (x, y)
+
+    # -- vignette ------------------------------------------------------
+    def vignette(self, max_dark=0.18):
+        """Soft radial darkening, separable row/col factors (precomputed)."""
+        cx = self.w / 2.0
+        cy = self.h / 2.0
+        fx = []
+        for x in range(self.w):
+            d = abs(x - cx) / cx
+            fx.append(1.0 - max_dark * max(0.0, (d - 0.55) / 0.45) ** 2)
+        fy = []
+        for y in range(self.h):
+            d = abs(y - cy) / cy
+            fy.append(1.0 - max_dark * max(0.0, (d - 0.55) / 0.45) ** 2)
+        buf = self.buf
+        for y in range(self.h):
+            fyy = fy[y]
+            base = y * self.w * 3
+            for x in range(self.w):
+                f = fx[x] * fyy
+                if f >= 0.999:
+                    continue
+                i = base + x * 3
+                buf[i] = int(buf[i] * f)
+                buf[i + 1] = int(buf[i + 1] * f)
+                buf[i + 2] = int(buf[i + 2] * f)
 
 
+# -- 5x7 bitmap font (own design, only the letters we need) -----------
+# '#' = on, '.' = off. 5 wide, 7 tall.
+GLYPHS = {
+    'V': ["#...#",
+          "#...#",
+          "#...#",
+          "#...#",
+          ".#.#.",
+          ".#.#.",
+          "..#.."],
+    'E': ["#####",
+          "#....",
+          "#....",
+          "####.",
+          "#....",
+          "#....",
+          "#####"],
+    'L': ["#....",
+          "#....",
+          "#....",
+          "#....",
+          "#....",
+          "#....",
+          "#####"],
+    'M': ["#...#",
+          "##.##",
+          "#.#.#",
+          "#.#.#",
+          "#...#",
+          "#...#",
+          "#...#"],
+    'O': [".###.",
+          "#...#",
+          "#...#",
+          "#...#",
+          "#...#",
+          "#...#",
+          ".###."],
+    'R': ["####.",
+          "#...#",
+          "#...#",
+          "####.",
+          "#.#..",
+          "#..#.",
+          "#...#"],
+    'A': [".###.",
+          "#...#",
+          "#...#",
+          "#####",
+          "#...#",
+          "#...#",
+          "#...#"],
+}
+
+
+def draw_text(c, text, x0, y0, scale, tracking, color, shadow=None,
+              shadow_dy=6, stroke=None):
+    """Draw bitmap text. Returns total pixel width."""
+    total = sum(5 * scale for _ in text) + tracking * (len(text) - 1)
+
+    def _draw_at(ox, oy, col):
+        x = x0 + ox
+        for ch in text:
+            g = GLYPHS[ch]
+            for r, row in enumerate(g):
+                for col_i, px in enumerate(row):
+                    if px == '#':
+                        c.fill_rect(x + col_i * scale, y0 + oy + r * scale,
+                                    scale, scale, col)
+            x += 5 * scale + tracking
+
+    # shadow first (solid navy, offset down), then stroke (2px navy in
+    # 4 directions), then the cream face.
+    if shadow is not None:
+        _draw_at(0, shadow_dy, shadow)
+    if stroke is not None:
+        for ox, oy in ((-2, 0), (2, 0), (0, -2), (0, 2)):
+            _draw_at(ox, oy, stroke)
+    _draw_at(0, 0, color)
+    return total
+
+
+# -- PNG encoder (own, deterministic) ----------------------------------
+def _chunk(ctype, data):
+    out = struct.pack(">I", len(data)) + ctype + data
+    out += struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+    return out
+
+
+def encode_png(c):
+    ihdr = struct.pack(">IIBBBBB", c.w, c.h, 8, 2, 0, 0, 0)
+    raw = bytearray()
+    row_bytes = c.w * 3
+    for y in range(c.h):
+        raw.append(0)  # filter 0 (None)
+        s = y * row_bytes
+        raw += c.buf[s:s + row_bytes]
+    idat = zlib.compress(bytes(raw), 6)
+    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
+            + _chunk(b"IDAT", idat) + _chunk(b"IEND", b""))
+
+
+# -- the poster --------------------------------------------------------
 def render_poster():
     random.seed(7)
-    try:
-        import numpy as np
-        np.random.seed(7)
-        have_np = True
-    except Exception:
-        have_np = False
+    c = Canvas()
 
-    # 1. Sky: deep purple -> coral -> thin amber at the horizon.
-    sky = _vgrad(W, HORIZON + 1, [
-        (0.0, SKY_TOP),
-        (0.86, CORAL),
-        (1.0, AMBER),
+    # 1. Sky: vertical 3-stop gradient purple -> coral -> amber horizon.
+    c.vgrad(0, HORIZON, [
+        (0.00, SKY_TOP),
+        (0.55, (0x6E, 0x3D, 0x6B)),
+        (0.85, CORAL),
+        (1.00, AMBER),
     ])
-    img = Image.new("RGB", (W, H), SKY_TOP)
-    img.paste(sky, (0, 0))
 
-    # 2. Sun glow + solid amber disc + thin cream rim.
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow)
-    cx, cy = SUN_CENTRE
-    for r, a in ((180, 16), (140, 26), (110, 40), (90, 60)):
-        gd.ellipse([cx - r, cy - r, cx + r, cy + r], fill=AMBER + (a,))
-    img = Image.alpha_composite(img.convert("RGBA"), glow)
-    d = ImageDraw.Draw(img)
-    d.ellipse([cx - SUN_R, cy - SUN_R, cx + SUN_R, cy + SUN_R], fill=AMBER)
-    d.ellipse([cx - SUN_R, cy - SUN_R, cx + SUN_R, cy + SUN_R],
-              outline=CREAM + (220,), width=3)
+    # 2. Sun glow (layered alpha ellipses = glow, no blur needed),
+    #    then cream rim + solid amber disc at (700, 470), r 70.
+    for r, a in ((180, 16), (140, 26), (105, 42)):
+        c.fill_ellipse(700, 470, r, r, AMBER, a)
+    c.fill_disc(700, 470, 72, CREAM, 255)
+    c.fill_disc(700, 470, 70, AMBER, 255)
 
-    # 3. Clouds: soft blurred cream/coral ellipses, y 150-350.
-    clouds = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    cd = ImageDraw.Draw(clouds)
-    for (ccx, ccy, cw, ch, alpha) in (
-            (250, 210, 260, 34, 46), (430, 250, 200, 28, 38),
-            (820, 180, 240, 30, 40), (620, 320, 180, 24, 30)):
-        cd.ellipse([ccx - cw // 2, ccy - ch // 2, ccx + cw // 2, ccy + ch // 2],
-                   fill=CREAM + (alpha,))
-    clouds = clouds.filter(ImageFilter.GaussianBlur(16))
-    img.alpha_composite(clouds)
+    # 3. Clouds: soft low-alpha cream/coral ellipses, y 150-350.
+    clouds = [(200, 210, 120, 26), (330, 180, 90, 20), (880, 300, 130, 24),
+              (950, 180, 80, 18), (120, 330, 100, 20), (620, 150, 90, 16)]
+    for cx, cy, rx, ry in clouds:
+        c.fill_ellipse(cx, cy, rx, ry, CREAM, 22)
+        c.fill_ellipse(cx, cy, int(rx * 0.6), int(ry * 0.6), CORAL, 14)
 
-    # 4. Distant headland silhouette, low on the left horizon.
-    head = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    hd = ImageDraw.Draw(head)
-    hd.polygon([(0, 560), (0, 538), (90, 528), (190, 540), (260, 552),
-                (300, 560)], fill=(0x24, 0x1C, 0x44, 150))
-    img.alpha_composite(head)
+    # 4. Distant headland, very low silhouette at the left horizon.
+    c.fill_polygon([(0, 560), (0, 540), (90, 532), (190, 544),
+                    (260, 556), (260, 560)], (0x3A, 0x2E, 0x5E), 150)
 
-    # 5. Sea: turquoise -> deep teal, shimmer + sun-reflection column.
-    sea = _vgrad(W, H - HORIZON, [(0.0, TURQUOISE), (1.0, TEAL)])
-    img.paste(sea, (0, HORIZON))
-    d = ImageDraw.Draw(img, "RGBA")
-    # Shimmer: short pale horizontal dashes, seeded and regular.
-    for _ in range(160):
-        sx = random.randint(20, W - 120)
-        sy = random.randint(HORIZON + 12, H - 20)
-        ln = random.randint(18, 70)
-        a = random.randint(18, 55)
-        d.line([(sx, sy), (sx + ln, sy)], fill=CREAM + (a,), width=2)
-    # Sun reflection column under the sun, widening downward.
-    for row_i in range(46):
-        ry = HORIZON + 14 + row_i * 9
-        half = 26 + row_i * 2
-        seg = random.randint(30, 90)
-        sx = cx + random.randint(-half, half)
-        a = max(24, 150 - row_i * 2)
-        col = AMBER if row_i % 3 else CREAM
-        d.line([(sx, ry), (sx + seg, ry)], fill=col + (a,), width=3)
+    # 5. Sea: turquoise -> deep teal gradient.
+    c.vgrad(HORIZON, H, [(0.0, TURQ), (1.0, TEAL)])
 
-    # 6. The Lantern Spire: needle rock, tapering tower, glowing lantern.
-    # Rock needle rising out of the lagoon.
-    d.polygon([(330, 730), (352, 612), (378, 588), (404, 612), (440, 730),
-               (410, 742), (360, 742)], fill=NAVY)
-    d.polygon([(352, 612), (378, 588), (404, 612), (392, 640), (364, 640)],
-              fill=(0x24, 0x33, 0x58))
-    # Tower body: trapezoid, pale stone, sunlit edge on the sun side.
-    d.polygon([(352, 612), (404, 612), (392, 318), (364, 318)], fill=STONE_DARK)
-    d.polygon([(352, 612), (378, 612), (378, 318), (364, 318)],
-              fill=STONE_LIGHT)
-    d.polygon([(378, 612), (404, 612), (392, 318), (378, 318)],
-              fill=(0x2A, 0x2A, 0x4A))
-    # Tower cap + lantern room (y 270-318) + dome.
-    d.rectangle([356, 312, 400, 322], fill=NAVY)
-    d.rectangle([362, 276, 394, 314], fill=AMBER)
-    d.rectangle([362, 276, 394, 314], outline=NAVY, width=3)
-    d.line([(378, 276), (378, 314)], fill=NAVY, width=3)
-    d.polygon([(358, 276), (398, 276), (378, 252)], fill=NAVY)
-    d.ellipse([372, 244, 384, 256], fill=AMBER)
-    # Lantern glow halo.
-    halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    hd2 = ImageDraw.Draw(halo)
-    for r, a in ((70, 22), (48, 36), (30, 55)):
-        hd2.ellipse([378 - r, 292 - r, 378 + r, 292 + r], fill=AMBER + (a,))
-    img.alpha_composite(halo)
-    d = ImageDraw.Draw(img, "RGBA")
-    # Light beams from the lantern (very faint, angled down so they
-    # never cross the place name above).
-    for ang, ln in ((8, 300), (18, 340), (30, 260)):
-        rad = math.radians(ang)
-        x2 = 378 + int(math.cos(rad) * ln)
-        y2 = 292 + int(math.sin(rad) * ln)
-        d.line([(378, 292), (x2, y2)], fill=AMBER + (20,), width=4)
-    # Small amber windows down the tower body.
-    for wy in (360, 420, 480, 540):
-        d.rectangle([372, wy, 384, wy + 18], fill=AMBER + (235,),
-                    outline=NAVY + (255,))
+    # 5b. Sea shimmer: short thin horizontal lines, seeded, alpha low.
+    for _ in range(260):
+        y = random.randint(HORIZON + 8, H - 10)
+        x = random.randint(0, W - 120)
+        ln = random.randint(18, 90)
+        col = CREAM if random.random() < 0.35 else TURQ
+        a = random.randint(14, 42)
+        c.thick_line(x, y, x + ln, y, col, 2, a)
 
-    # 7. Arched bridge from the rock to the right shore.
-    d.arc([430, 600, 780, 760], start=200, end=340, fill=NAVY + (255,),
-          width=6)
-    for px in (520, 620, 710):
-        # Short support posts under the arc (arc ellipse centre
-        # (605, 680), rx 175, ry 80 — post top sits on the arc).
-        t = (px - 605) / 175.0
-        py = 680 - int(80 * math.sqrt(max(0.0, 1 - t * t)))
-        d.line([(px, py), (px, py + 30)], fill=NAVY + (255,), width=4)
+    # 5c. Sun reflection column under the sun (x 640-760), widening down.
+    for k in range(46):
+        y = HORIZON + 12 + k * 10
+        half = 26 + k * 1.6
+        x0 = int(700 - half + random.randint(-8, 8))
+        ln = int(half * 2 * random.uniform(0.45, 0.95))
+        col = AMBER if random.random() < 0.6 else CREAM
+        c.thick_line(x0, y, x0 + ln, y, col, 3,
+                     random.randint(30, 80))
 
-    # 8a. Little sailboat at (820, 640) for scale.
-    d.polygon([(800, 652), (842, 652), (832, 662), (810, 662)], fill=NAVY)
-    d.line([(821, 652), (821, 612)], fill=NAVY, width=3)
-    d.polygon([(821, 612), (821, 650), (852, 650)], fill=CREAM)
-    d.polygon([(821, 618), (821, 650), (798, 650)], fill=(0xE8, 0xD9, 0xB8))
+    # 6. Needle rock (navy) x ~340-430, y 560-720.
+    c.fill_polygon([(352, 720), (428, 720), (420, 640), (408, 585),
+                    (392, 560), (368, 560), (352, 600), (344, 660)],
+                   NAVY, 255)
+    # pale sunlit edge on the rock's right side
+    c.fill_polygon([(408, 585), (420, 640), (428, 720), (414, 720),
+                    (406, 640), (398, 590)], STONE, 255)
 
-    # 8b. Cream sand crescent, bottom-left foreground.
-    d.polygon([(0, 880), (120, 872), (260, 886), (380, 902), (430, 918),
-               (300, 960), (140, 1000), (0, 1024)], fill=CREAM)
-    d.polygon([(0, 880), (120, 872), (260, 886), (380, 902), (430, 918),
-               (300, 960), (140, 1000), (0, 1024)], outline=(0xE0, 0xC9, 0x9E))
-    # Dune grass tufts on the sand.
-    for gx, gy in ((90, 905), (180, 898), (260, 912), (330, 922)):
+    # 6b. The Lantern Spire: tapered tower y 300-700, base ~55, top ~30.
+    c.fill_polygon([(357, 700), (413, 700), (398, 300), (372, 300)],
+                   NAVY, 255)
+    # sunlit stone face (right side of the tower)
+    c.fill_polygon([(390, 700), (413, 700), (398, 300), (390, 300)],
+                   STONE, 255)
+    # lantern room y 270-300 + small dome, glowing amber
+    c.fill_ellipse(385, 272, 26, 14, AMBER, 90)   # halo
+    c.fill_rect(363, 272, 44, 30, AMBER, 255)
+    c.fill_ellipse(385, 272, 24, 12, NAVY, 255)   # dome
+    c.fill_rect(381, 258, 8, 8, NAVY, 255)        # finial
+    # lantern glow spill
+    c.fill_ellipse(385, 287, 60, 26, AMBER, 26)
+    # 4 small amber windows down the tower body
+    for wy in (360, 440, 520, 600):
+        c.fill_rect(379, wy, 12, 18, AMBER, 255)
+    # thin light beams from the lantern (very low alpha)
+    c.thick_line(363, 282, 180, 240, AMBER, 2, 26)
+    c.thick_line(407, 282, 590, 235, AMBER, 2, 26)
+
+    # 7. Arched bridge: rock (430, 660) -> beach right (760, 700).
+    c.bezier((430, 660), (600, 590), (760, 700), NAVY, 6, 255)
+    c.thick_line(520, 648, 520, 690, NAVY, 4, 255)
+    c.thick_line(650, 640, 650, 700, NAVY, 4, 255)
+
+    # 8a. Little sailboat at (820, 640): navy hull + cream sail.
+    c.thick_line(820, 600, 820, 648, NAVY, 3, 255)          # mast
+    c.fill_polygon([(822, 604), (822, 644), (862, 644)], CREAM, 255)
+    c.fill_polygon([(818, 610), (818, 644), (790, 644)], CREAM, 200)
+    c.fill_polygon([(792, 648), (852, 648), (842, 664), (802, 664)],
+                   NAVY, 255)
+
+    # 8b. Crescent cream beach, bottom-left foreground.
+    c.fill_polygon([(0, 880), (150, 858), (300, 878), (420, 918),
+                    (400, 1024), (0, 1024)], CREAM, 255)
+    # dune grass tufts (thin navy strokes)
+    for gx, gy in ((90, 884), (150, 872), (220, 872), (300, 890),
+                   (360, 908)):
         for dx in (-8, 0, 8):
-            d.line([(gx + dx, gy), (gx + dx * 2, gy - 22)],
-                   fill=NAVY + (255,), width=2)
+            c.thick_line(gx, gy, gx + dx, gy - 22, NAVY, 2, 255)
 
-    # 8c. Birds: small "v" curves, upper right sky.
-    for bx, by, s in ((660, 220, 14), (730, 205, 11), (800, 240, 13),
-                      (880, 215, 10), (940, 255, 12)):
-        d.arc([bx - s, by - s // 2, bx, by + s // 2], start=270, end=360,
-              fill=NAVY + (255,), width=3)
-        d.arc([bx, by - s // 2, bx + s, by + s // 2], start=180, end=270,
-              fill=NAVY + (255,), width=3)
+    # 8c. Birds: small navy "v" curves, right sky (clear of the name).
+    for bx, by in ((790, 300), (850, 330), (910, 295), (120, 310),
+                   (180, 340)):
+        c.thick_line(bx - 12, by, bx, by - 8, NAVY, 2, 255)
+        c.thick_line(bx, by - 8, bx + 12, by, NAVY, 2, 255)
 
-    # 9. Fine grain (numpy) + 10. soft vignette.
-    if have_np:
-        import numpy as np
-        arr = np.asarray(img.convert("RGB")).astype(np.int16)
-        noise = np.random.normal(0, 1.5, arr.shape[:2])[..., None]
-        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-        img = Image.fromarray(arr, "RGB").convert("RGBA")
-        yy, xx = np.mgrid[0:H, 0:W]
-        dx = (xx - W / 2) / (W / 2)
-        dy = (yy - H / 2) / (H / 2)
-        r = np.sqrt(dx * dx + dy * dy)
-        vig = np.clip(1.0 - 0.18 * np.clip(r - 0.55, 0, None) ** 2 * 2.2,
-                      0.82, 1.0)
-        arr = np.asarray(img.convert("RGB")).astype(float) * vig[..., None]
-        img = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8),
-                              "RGB").convert("RGBA")
-    else:
-        img = img.convert("RGBA")
+    # 9. Vignette (soft radial darkening, max ~18% at corners).
+    c.vignette(0.18)
 
-    # 11. The name, on top of everything. Only text in the image.
-    font_name, font_size, name_w, name_h = _draw_name(img)
-    return img.convert("RGB"), {
-        "font": font_name,
-        "font_size": font_size,
+    # 10. Name VELMORA, top centre: bitmap 5x7, scale 18, tracking 18.
+    #     Total width 7*90 + 6*18 = 738 px, height 126 px, y 110-236.
+    name_w = draw_text(c, "VELMORA", 143, 110, 18, 18, CREAM,
+                       shadow=NAVY, shadow_dy=6, stroke=NAVY)
+
+    png = encode_png(c)
+    info = {
+        "size": (W, H),
         "name_width": name_w,
-        "name_height": name_h,
+        "name_height": 7 * 18,
+        "font": "bitmap-5x7 scale 18 (own, pure stdlib)",
     }
+    return png, info
